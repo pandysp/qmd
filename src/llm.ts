@@ -1396,7 +1396,9 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = new LlamaCpp({
+      rerankModel: process.env.QMD_RERANK_MODEL,
+    });
   }
   return defaultLlamaCpp;
 }
