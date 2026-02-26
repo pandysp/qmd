@@ -701,6 +701,14 @@ export class LlamaCpp implements LLM {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.rerankModelUri);
       const model = await llama.loadModel({ modelPath });
+      if (!model.fileInsights.supportsRanking) {
+        model.dispose();
+        throw new Error(
+          `Model "${this.rerankModelUri}" does not support ranking. ` +
+          `A ranking model requires a "cls.weight" or "cls.output.weight" tensor in the GGUF file ` +
+          `and either a SEP/EOS token or a "tokenizer.chat_template.rerank" metadata field.`
+        );
+      }
       this.rerankModel = model;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
@@ -718,10 +726,8 @@ export class LlamaCpp implements LLM {
    * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
    * Each context has its own sequence, so they can evaluate independently.
    *
-   * Tuning choices:
-   * - contextSize 1024: reranking chunks are ~800 tokens max, 1024 is plenty
-   * - flashAttention: ~20% less VRAM per context (568 vs 711 MB)
-   * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
+   * Note: LlamaRankingContextOptions does not include flashAttention — that option
+   * is specific to LlamaContext and is not forwarded by createRankingContext.
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
@@ -731,27 +737,19 @@ export class LlamaCpp implements LLM {
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      // ~960 MB per context with flash attention at contextSize 2048
       const n = await this.computeParallelism(1000);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-            flashAttention: true,
             ...(threads > 0 ? { threads } : {}),
-          } as any));
-        } catch {
+          }));
+        } catch (err) {
           if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
-            try {
-              this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-                ...(threads > 0 ? { threads } : {}),
-              }));
-            } catch {
-              throw new Error("Failed to create any rerank context");
-            }
+            throw new Error(
+              `Failed to create rerank context for "${this.rerankModelUri}": ${err instanceof Error ? err.message : String(err)}`
+            );
           }
           break;
         }
@@ -1072,6 +1070,13 @@ export class LlamaCpp implements LLM {
 
     // Reassemble scores in original order and sort
     const flatScores = allScores.flat();
+    if (flatScores.length > 0 && flatScores.every((s) => s === 0)) {
+      console.warn(
+        `[qmd] Reranker "${this.rerankModelUri}" returned all-zero scores. ` +
+        `The model may not be compatible with llama.cpp's ranking implementation. ` +
+        `Results will be returned in original order.`
+      );
+    }
     const ranked = texts
       .map((text, i) => ({ document: text, score: flatScores[i]! }))
       .sort((a, b) => b.score - a.score);
